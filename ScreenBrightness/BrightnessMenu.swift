@@ -27,14 +27,14 @@ struct BrightnessMenu: View {
                 }
             }
 
-            Divider()
+            if controller.status == .ready {
+                Divider()
+                MonitorControls(controller: controller)
+            }
 
-            VStack(spacing: 10) {
-                if !controller.inputs.isEmpty {
-                    InputRow(controller: controller)
-                }
+            if !controller.inputTap.isTrusted {
+                Divider()
                 KeyAccessRow(inputTap: controller.inputTap)
-                LaunchAtLoginRow(controller: controller)
             }
 
             Divider()
@@ -54,8 +54,12 @@ struct BrightnessMenu: View {
 struct BrightnessSymbol: View {
     let level: Double
 
+    static func name(for level: Double) -> String {
+        level < 0 ? "moon.fill" : level < 34 ? "sun.min.fill" : "sun.max.fill"
+    }
+
     var body: some View {
-        Image(systemName: level < 0 ? "moon.fill" : level < 34 ? "sun.min.fill" : "sun.max.fill")
+        Image(systemName: Self.name(for: level))
             .symbolRenderingMode(.hierarchical)
             .contentTransition(.symbolEffect(.replace))
     }
@@ -184,8 +188,8 @@ private struct BrightnessSlider: View {
         .accessibilityValue(Text(value / 100, format: .percent.precision(.fractionLength(0))))
         .accessibilityAdjustableAction { direction in
             switch direction {
-            case .increment: onChange(value + BrightnessController.keyStep)
-            case .decrement: onChange(value - BrightnessController.keyStep)
+            case .increment: onChange(value + BrightnessLevel.keyStep)
+            case .decrement: onChange(value - BrightnessLevel.keyStep)
             @unknown default: break
             }
         }
@@ -350,34 +354,88 @@ private struct KeyAccessRow: View {
     let inputTap: SystemInputTap
 
     var body: some View {
-        HStack {
-            SettingLabel(title: "Brightness keys & scrolling", systemImage: "keyboard")
-            Spacer()
-            if inputTap.isTrusted {
-                Label("Active", systemImage: "checkmark.circle.fill")
-                    .labelStyle(.titleAndIcon)
-                    .font(.system(size: 11, weight: .medium))
-                    .foregroundStyle(.green)
-            } else {
-                Button("Enable…", action: inputTap.requestAccess)
-                    .controlSize(.small)
+        NoticeCard(systemImage: "keyboard", tint: .accentColor,
+                   title: "Brightness keys and scrolling are off",
+                   message: "Allow Accessibility access so F1/F2 and scrolling on the menu bar icon can change brightness.") {
+            Button("Enable…", action: inputTap.requestAccess)
+        }
+    }
+}
+
+/// Contrast, volume and input: the monitor's other controls, shown when it supports them.
+private struct MonitorControls: View {
+    let controller: BrightnessController
+
+    var body: some View {
+        VStack(spacing: 10) {
+            if let contrast = controller.contrast {
+                CompactSliderRow(title: "Contrast", systemImage: "circle.lefthalf.filled",
+                                 value: contrast, onChange: controller.setContrast)
+            }
+            if controller.isMonitorAudioActive, let volume = controller.volume {
+                VolumeRow(controller: controller, volume: volume)
+            }
+            if !controller.inputs.isEmpty {
+                InputRow(controller: controller)
             }
         }
     }
 }
 
-private struct LaunchAtLoginRow: View {
-    let controller: BrightnessController
+private struct CompactSliderRow: View {
+    let title: LocalizedStringKey
+    let systemImage: String
+    let value: Double
+    let onChange: @MainActor @Sendable (Double) -> Void
 
     var body: some View {
-        HStack {
-            SettingLabel(title: "Launch at login", systemImage: "power")
-            Spacer()
-            Toggle("Launch at login", isOn: Binding(get: { controller.launchesAtLogin },
-                                                    set: { controller.setLaunchesAtLogin($0) }))
-                .labelsHidden()
-                .toggleStyle(.switch)
-                .controlSize(.mini)
+        HStack(spacing: 8) {
+            SettingLabel(title: title, systemImage: systemImage)
+                .frame(width: 92, alignment: .leading)
+            Slider(value: Binding(get: { value }, set: onChange), in: 0...100)
+                .controlSize(.small)
+            Text(value, format: .number.precision(.fractionLength(0)))
+                .font(.system(size: 11, weight: .medium, design: .rounded))
+                .monospacedDigit()
+                .foregroundStyle(.secondary)
+                .frame(width: 26, alignment: .trailing)
+        }
+    }
+}
+
+private struct VolumeRow: View {
+    let controller: BrightnessController
+    let volume: Double
+
+    var body: some View {
+        HStack(spacing: 8) {
+            Button {
+                controller.setMuted(!controller.isMuted)
+            } label: {
+                Label {
+                    Text("Volume")
+                        .font(.system(size: 12))
+                        .foregroundStyle(.primary)
+                } icon: {
+                    Image(systemName: controller.isMuted ? "speaker.slash.fill" : "speaker.wave.2.fill")
+                        .font(.system(size: 11, weight: .medium))
+                        .foregroundStyle(controller.isMuted ? AnyShapeStyle(.orange) : AnyShapeStyle(.secondary))
+                        .contentTransition(.symbolEffect(.replace))
+                        .frame(width: 16)
+                }
+            }
+            .buttonStyle(.plain)
+            .help(controller.isMuted ? "Unmute" : "Mute")
+            .frame(width: 92, alignment: .leading)
+
+            Slider(value: Binding(get: { volume }, set: { controller.setVolume($0) }), in: 0...100)
+                .controlSize(.small)
+                .opacity(controller.isMuted ? 0.5 : 1)
+            Text(volume, format: .number.precision(.fractionLength(0)))
+                .font(.system(size: 11, weight: .medium, design: .rounded))
+                .monospacedDigit()
+                .foregroundStyle(.secondary)
+                .frame(width: 26, alignment: .trailing)
         }
     }
 }

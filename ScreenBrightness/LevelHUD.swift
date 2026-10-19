@@ -2,28 +2,40 @@ import AppKit
 import Observation
 import SwiftUI
 
-/// The on-screen indicator shown while using the brightness keys: a glass pill in the
-/// top-right corner of the monitor being adjusted, like the system volume HUD.
+/// The on-screen indicator shown while changing brightness or volume from the keyboard or
+/// the menu bar icon: a glass pill in the top-right corner of the monitor, like the system HUD.
 @MainActor
-final class BrightnessHUD {
+final class LevelHUD {
+    struct Content: Equatable {
+        var systemImage: String
+        var title: String
+        /// How full the bar is, 0…1.
+        var fraction: Double
+        /// Shown as a percentage on the right.
+        var value: Double
+        /// Replaces the percentage, e.g. "Muted".
+        var valueText: String?
+        /// Indigo instead of the default colour, for extra dimming.
+        var isAccented = false
+    }
+
     @MainActor
     @Observable
     final class Model {
-        var level: Double = 0
-        var minimumLevel: Double = 0
-        var displayName = "External Display"
+        var content = Content(systemImage: "sun.max.fill", title: "", fraction: 0, value: 0)
     }
 
+    /// Sits just above the extra-dimming overlay so the HUD stays readable.
+    static let windowLevel = NSWindow.Level(rawValue: SoftwareDimmer.overlayWindowLevel.rawValue + 1)
+
     private let model = Model()
-    private lazy var hostingController = NSHostingController(rootView: BrightnessHUDView(model: model))
+    private lazy var hostingController = NSHostingController(rootView: LevelHUDView(model: model))
     private var panel: NSPanel?
     private var hideTask: Task<Void, Never>?
 
-    func show(level: Double, minimumLevel: Double, displayName: String?, on screen: NSScreen?) {
-        model.displayName = displayName ?? "External Display"
+    func show(_ content: Content, on screen: NSScreen?) {
         withAnimation(.snappy(duration: 0.18)) {
-            model.level = level
-            model.minimumLevel = minimumLevel
+            model.content = content
         }
 
         let panel = self.panel ?? makePanel()
@@ -58,40 +70,48 @@ final class BrightnessHUD {
         panel.backgroundColor = .clear
         panel.hasShadow = false
         panel.ignoresMouseEvents = true
-        panel.level = .statusBar
+        panel.level = Self.windowLevel
         panel.collectionBehavior = [.canJoinAllSpaces, .fullScreenAuxiliary, .stationary, .ignoresCycle]
         return panel
     }
 }
 
-private struct BrightnessHUDView: View {
-    let model: BrightnessHUD.Model
+private struct LevelHUDView: View {
+    let model: LevelHUD.Model
 
     var body: some View {
+        let content = model.content
         HStack(spacing: 12) {
-            BrightnessSymbol(level: model.level)
+            Image(systemName: content.systemImage)
+                .symbolRenderingMode(.hierarchical)
+                .contentTransition(.symbolEffect(.replace))
                 .font(.system(size: 18, weight: .semibold))
                 .frame(width: 24)
 
             VStack(alignment: .leading, spacing: 7) {
-                Text(model.level < 0 ? "Extra dimming" : model.displayName)
+                Text(content.title)
                     .font(.system(size: 12, weight: .semibold))
                     .foregroundStyle(.secondary)
                     .lineLimit(1)
-                LevelBar(fraction: (model.level - model.minimumLevel) / (100 - model.minimumLevel),
-                         tint: model.level < 0 ? .indigo : .primary)
+                LevelBar(fraction: content.fraction, tint: content.isAccented ? .indigo : .primary)
                     .frame(height: 6)
             }
 
-            Text(model.level / 100, format: .percent.precision(.fractionLength(0)))
-                .font(.system(size: 13, weight: .semibold, design: .rounded))
-                .monospacedDigit()
-                .contentTransition(.numericText(value: model.level))
-                .frame(width: 40, alignment: .trailing)
+            Group {
+                if let valueText = content.valueText {
+                    Text(valueText)
+                } else {
+                    Text(content.value / 100, format: .percent.precision(.fractionLength(0)))
+                        .contentTransition(.numericText(value: content.value))
+                }
+            }
+            .font(.system(size: 13, weight: .semibold, design: .rounded))
+            .monospacedDigit()
+            .frame(width: 48, alignment: .trailing)
         }
         .padding(.horizontal, 16)
         .padding(.vertical, 12)
-        .frame(width: 290)
+        .frame(width: 300)
         .glassEffect(.regular, in: .rect(cornerRadius: 22))
         .padding(10)
     }
@@ -108,7 +128,7 @@ private struct LevelBar: View {
                 .overlay(alignment: .leading) {
                     Capsule()
                         .fill(tint)
-                        .frame(width: max(proxy.size.height, proxy.size.width * fraction))
+                        .frame(width: max(proxy.size.height, proxy.size.width * min(max(fraction, 0), 1)))
                 }
         }
     }

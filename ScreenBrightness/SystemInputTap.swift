@@ -2,29 +2,37 @@ import AppKit
 import ApplicationServices
 import Observation
 
-enum BrightnessDirection {
-    case up, down
-}
-
 /// A system-wide event tap for input macOS doesn't hand to the app on its own:
 /// - the keyboard brightness keys (F1/F2 on Mac layouts), which go nowhere without a built-in display;
+/// - the volume keys, when the controller wants them (sound playing through the monitor);
 /// - scroll-wheel events over the menu bar icon, which macOS 26+ doesn't deliver to status items.
 /// Both are swallowed once handled. Needs Accessibility access.
 @MainActor
 @Observable
 final class SystemInputTap {
+    enum VolumeKey {
+        case up, down, mute
+    }
+
     private(set) var isTrusted = AXIsProcessTrusted()
 
     @ObservationIgnored var onBrightnessKey: ((BrightnessDirection, _ fine: Bool) -> Void)?
+    /// Returns whether the key was handled; unhandled volume keys pass through to macOS.
+    @ObservationIgnored var onVolumeKey: ((VolumeKey, _ fine: Bool) -> Bool)?
     @ObservationIgnored var onStatusItemScroll: ((_ deltaY: Double, _ isPrecise: Bool) -> Void)?
     @ObservationIgnored private var tap: CFMachPort?
     @ObservationIgnored private var trustPoll: Timer?
+    /// Whether the last volume key-down was handled, so its key-up is swallowed too.
+    @ObservationIgnored private var capturedVolumeKey = false
 
     // From IOKit/hidsystem/ev_keymap.h.
     private static let systemDefinedEventType: UInt32 = 14
     private static let auxControlButtonsSubtype: Int16 = 8
+    private static let soundUpKey = 0
+    private static let soundDownKey = 1
     private static let brightnessUpKey = 2
     private static let brightnessDownKey = 3
+    private static let muteKey = 7
 
     func start() {
         isTrusted = AXIsProcessTrusted()
@@ -104,19 +112,24 @@ final class SystemInputTap {
         let keyCode = (nsEvent.data1 & 0xFFFF_0000) >> 16
         let keyFlags = nsEvent.data1 & 0x0000_FFFF
         let isKeyDown = (keyFlags & 0xFF00) >> 8 == 0x0A
-        let direction: BrightnessDirection
-        switch keyCode {
-        case Self.brightnessUpKey: direction = .up
-        case Self.brightnessDownKey: direction = .down
-        default: return false
-        }
+        // ⌥⇧ gives quarter steps, matching the built-in display behaviour.
+        let fine = nsEvent.modifierFlags.isSuperset(of: [.option, .shift])
 
-        if isKeyDown {
-            // ⌥⇧ gives quarter steps, matching the built-in display behaviour.
-            let fine = nsEvent.modifierFlags.isSuperset(of: [.option, .shift])
-            onBrightnessKey?(direction, fine)
+        switch keyCode {
+        case Self.brightnessUpKey, Self.brightnessDownKey:
+            if isKeyDown {
+                onBrightnessKey?(keyCode == Self.brightnessUpKey ? .up : .down, fine)
+            }
+            return true
+        case Self.soundUpKey, Self.soundDownKey, Self.muteKey:
+            if isKeyDown {
+                let key: VolumeKey = keyCode == Self.soundUpKey ? .up : keyCode == Self.soundDownKey ? .down : .mute
+                capturedVolumeKey = onVolumeKey?(key, fine) ?? false
+            }
+            return capturedVolumeKey
+        default:
+            return false
         }
-        return true
     }
 
     /// `location` is in global display coordinates (origin top-left of the main display).

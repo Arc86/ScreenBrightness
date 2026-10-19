@@ -3,7 +3,7 @@ import SwiftUI
 
 struct SettingsView: View {
     enum Pane: Hashable {
-        case general, presets
+        case general, keyboard, presets
     }
 
     let controller: BrightnessController
@@ -19,11 +19,14 @@ struct SettingsView: View {
             Tab("General", systemImage: "gearshape", value: .general) {
                 GeneralSettings(controller: controller)
             }
+            Tab("Keyboard", systemImage: "keyboard", value: .keyboard) {
+                KeyboardSettings(controller: controller)
+            }
             Tab("Presets", systemImage: "square.grid.2x2", value: .presets) {
                 PresetSettings(controller: controller)
             }
         }
-        .frame(width: 480, height: 580)
+        .frame(width: 480, height: 640)
     }
 }
 
@@ -38,23 +41,39 @@ private struct GeneralSettings: View {
                     Text("Extra dimming below 0%")
                     Text("Keeps dimming in software once the monitor reaches its minimum. Useful at night on an OLED.")
                 }
+                if controller.allowsExtraDimming {
+                    Picker(selection: $controller.dimmingMethod) {
+                        Text("Color tables").tag(SoftwareDimmer.Method.gamma)
+                        Text("Overlay").tag(SoftwareDimmer.Method.overlay)
+                    } label: {
+                        Text("Dimming method")
+                        Text(controller.dimmingMethod == .gamma
+                             ? "Deepest blacks. Can clash with Night Shift or f.lux while dimmed."
+                             : "Works alongside Night Shift and f.lux.")
+                    }
+                }
             } header: {
                 Text("Brightness")
+            } footer: {
+                if controller.allowsExtraDimming {
+                    Text("While HDR is on, the overlay is always used. Neither method shows up in screenshots.")
+                        .foregroundStyle(.secondary)
+                }
             }
 
             Section {
-                LabeledContent("Brighter") {
-                    ShortcutRecorder(hotkey: $controller.brighterHotkey,
-                                     isConflicting: controller.hotkeyConflicts.contains(.up))
-                }
-                LabeledContent("Dimmer") {
-                    ShortcutRecorder(hotkey: $controller.dimmerHotkey,
-                                     isConflicting: controller.hotkeyConflicts.contains(.down))
+                Toggle("Dim when idle", isOn: $controller.dimsWhenIdle)
+                if controller.dimsWhenIdle {
+                    Picker("After", selection: $controller.idleMinutes) {
+                        ForEach(BrightnessController.idleMinuteChoices, id: \.self) { minutes in
+                            Text(minutes == 1 ? "1 minute" : "\(minutes) minutes").tag(minutes)
+                        }
+                    }
                 }
             } header: {
-                Text("Keyboard Shortcuts")
+                Text("Idle")
             } footer: {
-                Text("Works from any app. Hold to keep changing. The F1/F2 brightness keys and scrolling on the menu bar icon also work.")
+                Text(idleFooter)
                     .foregroundStyle(.secondary)
             }
 
@@ -72,6 +91,59 @@ private struct GeneralSettings: View {
             } footer: {
                 Text("Set brightness, apply a preset or switch inputs from Shortcuts or Siri. Add a personal automation to change brightness at sunset or when a Focus turns on.")
                     .foregroundStyle(.secondary)
+            }
+        }
+        .formStyle(.grouped)
+    }
+
+    private var idleFooter: String {
+        let base = "Fades the monitor to 0% when you step away and restores it as soon as you're back. Easier on an OLED."
+        guard controller.dimsWhenIdle, !controller.idleDimBlockers.isEmpty else {
+            return base + " Skipped while an app keeps the display awake, such as a video player."
+        }
+        return base + " Last skipped because \(controller.idleDimBlockers.formatted(.list(type: .and))) kept the display awake."
+    }
+}
+
+private struct KeyboardSettings: View {
+    @Bindable var controller: BrightnessController
+
+    var body: some View {
+        Form {
+            Section {
+                LabeledContent("Brighter") {
+                    ShortcutRecorder(hotkey: $controller.brighterHotkey,
+                                     isConflicting: controller.hotkeyConflicts.contains(.up))
+                }
+                LabeledContent("Dimmer") {
+                    ShortcutRecorder(hotkey: $controller.dimmerHotkey,
+                                     isConflicting: controller.hotkeyConflicts.contains(.down))
+                }
+            } header: {
+                Text("Brightness Shortcuts")
+            } footer: {
+                Text("Work from any app. Hold to keep changing. The F1/F2 brightness keys and scrolling on the menu bar icon also work.")
+                    .foregroundStyle(.secondary)
+            }
+
+            Section {
+                Toggle(isOn: $controller.controlsMonitorVolume) {
+                    Text("Volume keys control the monitor")
+                    Text("When sound plays through the monitor over HDMI or DisplayPort, macOS can't change its volume. The volume and mute keys then go to the monitor instead.")
+                }
+            } header: {
+                Text("Volume")
+            }
+
+            if !controller.inputTap.isTrusted {
+                Section {
+                    LabeledContent("Accessibility access") {
+                        Button("Enable…", action: controller.inputTap.requestAccess)
+                    }
+                } footer: {
+                    Text("Needed for the F1/F2 keys, the volume keys and scrolling on the menu bar icon. Custom shortcuts work without it.")
+                        .foregroundStyle(.secondary)
+                }
             }
         }
         .formStyle(.grouped)

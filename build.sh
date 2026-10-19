@@ -18,6 +18,19 @@ cp -R build/DerivedData/Build/Products/Release/ScreenBrightness.app build/
 codesign --verify --strict --deep build/ScreenBrightness.app
 echo "Built build/ScreenBrightness.app"
 
+# Notarizing lets the app open on other Macs without a Gatekeeper warning. It needs a stored
+# notarytool profile, created once with:
+#   xcrun notarytool store-credentials ScreenBrightness --apple-id <id> --team-id 9WFDLY652Y
+if [[ "${1:-}" == "notarize" ]]; then
+  NOTARY_PROFILE="${NOTARY_PROFILE:-ScreenBrightness}"
+  ditto -c -k --keepParent build/ScreenBrightness.app build/ScreenBrightness.zip
+  xcrun notarytool submit build/ScreenBrightness.zip --keychain-profile "$NOTARY_PROFILE" --wait
+  xcrun stapler staple build/ScreenBrightness.app
+  ditto -c -k --keepParent build/ScreenBrightness.app build/ScreenBrightness.zip
+  spctl -a -vv build/ScreenBrightness.app
+  echo "Notarized build/ScreenBrightness.app (zipped at build/ScreenBrightness.zip)"
+fi
+
 if [[ "${1:-}" == "install" ]]; then
   pkill -x ScreenBrightness 2>/dev/null || true
   rm -rf /Applications/ScreenBrightness.app

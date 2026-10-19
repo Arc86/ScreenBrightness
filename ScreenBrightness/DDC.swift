@@ -16,15 +16,9 @@ private func IOAVServiceWriteI2C(_ service: CFTypeRef, _ chipAddress: UInt32, _ 
 /// One external display reachable over DDC/CI. Calls block for tens of milliseconds,
 /// so only use an instance from a single background queue.
 final class DDCService: @unchecked Sendable {
-    enum VCP: UInt8 {
-        case brightness = 0x10
-        case input = 0x60
-    }
+    typealias VCP = DDCProtocol.VCP
 
     private static let chipAddress: UInt32 = 0x37
-    private static let dataAddress: UInt32 = 0x51
-    private static let hostAddress: UInt8 = 0x6E
-    private static let replyChecksumSeed: UInt8 = 0x50
 
     private let service: CFTypeRef
 
@@ -53,22 +47,13 @@ final class DDCService: @unchecked Sendable {
 
     func read(_ code: VCP, attempts: Int = 3) -> (current: Int, maximum: Int)? {
         for _ in 0..<attempts {
-            guard send([0x01, code.rawValue]) else { continue }
+            guard send(DDCProtocol.getVCP(code)) else { continue }
             usleep(40_000)
-
-            var reply = [UInt8](repeating: 0, count: 11)
-            let result = reply.withUnsafeMutableBytes {
-                IOAVServiceReadI2C(service, Self.chipAddress, Self.dataAddress, $0.baseAddress!, UInt32($0.count))
+            if let reply = receive(DDCProtocol.vcpReplyLength),
+               let value = DDCProtocol.parseVCPReply(reply, for: code) {
+                return value
             }
-            let checksum = reply[0..<10].reduce(Self.replyChecksumSeed, ^)
-            guard result == kIOReturnSuccess, checksum == reply[10],
-                  reply[2] == 0x02, reply[3] == 0x00, reply[4] == code.rawValue else {
-                usleep(30_000)
-                continue
-            }
-            let maximum = Int(reply[6]) << 8 | Int(reply[7])
-            let current = Int(reply[8]) << 8 | Int(reply[9])
-            return (current, max(maximum, 1))
+            usleep(30_000)
         }
         return nil
     }
@@ -79,56 +64,52 @@ final class DDCService: @unchecked Sendable {
         while data.count < 4096 {
             var chunk: [UInt8]?
             for _ in 0..<4 where chunk == nil {
-                let offset = UInt16(data.count)
-                guard send([0xF3, UInt8(offset >> 8), UInt8(offset & 0xFF)]) else { continue }
+                guard send(DDCProtocol.capabilitiesRequest(offset: data.count)) else { continue }
                 usleep(50_000)
-
-                // Reply: source, length, 0xE3, offset (2 bytes), up to 32 data bytes, checksum.
-                var reply = [UInt8](repeating: 0, count: 38)
-                let result = reply.withUnsafeMutableBytes {
-                    IOAVServiceReadI2C(service, Self.chipAddress, Self.dataAddress, $0.baseAddress!, UInt32($0.count))
-                }
-                let length = Int(reply[1] & 0x7F)
-                if result == kIOReturnSuccess, reply[2] == 0xE3, (3...35).contains(length) {
-                    chunk = Array(reply[5..<(2 + length)])
-                } else {
-                    usleep(50_000)
-                }
+                chunk = receive(DDCProtocol.capabilitiesReplyLength).flatMap(DDCProtocol.parseCapabilitiesReply)
+                if chunk == nil { usleep(50_000) }
             }
             guard let chunk else { return nil }
             if chunk.isEmpty { break }
             data += chunk
         }
-        return String(decoding: data.filter { $0 != 0 }, as: UTF8.self)
+        return DDCProtocol.capabilitiesString(from: data)
     }
 
     func write(_ code: VCP, value: Int) -> Bool {
-        let value = UInt16(clamping: value)
-        return send([0x03, code.rawValue, UInt8(value >> 8), UInt8(value & 0xFF)])
+        send(DDCProtocol.setVCP(code, value: value))
     }
 
-    /// Wraps a DDC command in the length prefix and checksum, then writes it.
-    private func send(_ command: [UInt8]) -> Bool {
-        var packet = [0x80 | UInt8(command.count)] + command
-        packet.append(packet.reduce(Self.hostAddress ^ UInt8(Self.dataAddress), ^))
+    private func send(_ packet: [UInt8]) -> Bool {
+        var packet = packet
         let result = packet.withUnsafeMutableBytes {
-            IOAVServiceWriteI2C(service, Self.chipAddress, Self.dataAddress, $0.baseAddress!, UInt32($0.count))
+            IOAVServiceWriteI2C(service, Self.chipAddress, UInt32(DDCProtocol.dataAddress), $0.baseAddress!, UInt32($0.count))
         }
         return result == kIOReturnSuccess
     }
+
+    private func receive(_ length: Int) -> [UInt8]? {
+        var reply = [UInt8](repeating: 0, count: length)
+        let result = reply.withUnsafeMutableBytes {
+            IOAVServiceReadI2C(service, Self.chipAddress, UInt32(DDCProtocol.dataAddress), $0.baseAddress!, UInt32($0.count))
+        }
+        return result == kIOReturnSuccess ? reply : nil
+    }
 }
 
-/// Serializes all DDC traffic on one queue and coalesces bursts of brightness writes
-/// (a dragged slider, a fade) so the monitor only ever sees the latest value.
+/// Serializes all DDC traffic on one queue and coalesces bursts of writes to the same
+/// control (a dragged slider, a fade) so the monitor only ever sees the latest value.
 final class DDCLink: @unchecked Sendable {
+    typealias VCP = DDCProtocol.VCP
+
     private let queue = DispatchQueue(label: "com.jespermol.ScreenBrightness.ddc", qos: .userInitiated)
 
     // Only touched on `queue`.
     private var service: DDCService?
-    private var pendingBrightness: Int?
+    private var pendingWrites: [VCP: Int] = [:]
     private var drainScheduled = false
 
-    func read(_ code: DDCService.VCP) async -> (current: Int, maximum: Int)? {
+    func read(_ code: VCP) async -> (current: Int, maximum: Int)? {
         await perform { $0.read(code) }
     }
 
@@ -136,13 +117,15 @@ final class DDCLink: @unchecked Sendable {
         await perform { $0.readCapabilities() }
     }
 
-    func write(_ code: DDCService.VCP, value: Int) async -> Bool {
+    /// Writes immediately, after any queued traffic, and reports whether the monitor accepted it.
+    func write(_ code: VCP, value: Int) async -> Bool {
         await perform { $0.write(code, value: value) ? true : nil } ?? false
     }
 
-    func setBrightness(_ percent: Int) {
+    /// Queues a write that later writes to the same control may replace before it is sent.
+    func set(_ code: VCP, value: Int) {
         queue.async { [self] in
-            pendingBrightness = percent
+            pendingWrites[code] = value
             guard !drainScheduled else { return }
             drainScheduled = true
             queue.async { [self] in drain() }
@@ -164,11 +147,11 @@ final class DDCLink: @unchecked Sendable {
 
     private func drain() {
         drainScheduled = false
-        guard let percent = pendingBrightness else { return }
-        pendingBrightness = nil
-        _ = withService { $0.write(.brightness, value: percent) ? true : nil }
-        // DDC/CI asks hosts to leave ~50 ms between commands.
-        usleep(50_000)
+        while let (code, value) = pendingWrites.popFirst() {
+            _ = withService { $0.write(code, value: value) ? true : nil }
+            // DDC/CI asks hosts to leave ~50 ms between commands.
+            usleep(50_000)
+        }
     }
 
     /// Runs `body` against the cached service, rediscovering it once if it fails.

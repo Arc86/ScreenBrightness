@@ -32,3 +32,23 @@ targets:
         INFOPLIST_KEY_CFBundleDisplayName: Screen Brightness
         INFOPLIST_KEY_LSApplicationCategoryType: public.app-category.utilities
         INFOPLIST_KEY_NSHumanReadableCopyright: ""
+    scheme:
+      testTargets:
+        - ScreenBrightnessTests
+
+  # Unit tests for the pure logic. They compile those files directly instead of loading the app,
+  # so running them never touches the monitor or installs event taps.
+  ScreenBrightnessTests:
+    type: bundle.unit-test
+    platform: macOS
+    sources:
+      - Tests
+      - ScreenBrightness/DDCProtocol.swift
+      - ScreenBrightness/BrightnessLevel.swift
+      - ScreenBrightness/MonitorCapabilities.swift
+      - ScreenBrightness/Preset.swift
+      - ScreenBrightness/Hotkeys.swift
+    settings:
+      base:
+        PRODUCT_BUNDLE_IDENTIFIER: com.jespermol.ScreenBrightnessTests
+        GENERATE_INFOPLIST_FILE: YES

@@ -1,17 +1,30 @@
 #!/bin/zsh
-# Builds ScreenBrightness.app signed with Developer ID, so macOS keeps the
-# Accessibility permission across rebuilds. Pass "install" to copy it to /Applications.
+# Builds build/ScreenBrightness.app. Pass "install" to copy it to /Applications,
+# or "notarize" to notarize it for other Macs.
+#
+# Signing: set SIGNING_IDENTITY (a certificate name or SHA-1 from `security find-identity -v -p codesigning`)
+# and DEVELOPMENT_TEAM to sign with your own Developer ID, so macOS keeps the Accessibility
+# permission across rebuilds. Without a matching certificate the app is signed ad hoc, which
+# works, but macOS asks for Accessibility again after every rebuild.
 set -euo pipefail
 cd "${0:A:h}"
 
 SIGNING_IDENTITY="${SIGNING_IDENTITY:-4D342BEA1039EF3ABCA370BDCBD694B78526A617}" # Developer ID Application: Jesper Mol
+DEVELOPMENT_TEAM="${DEVELOPMENT_TEAM:-9WFDLY652Y}"
+
+if security find-identity -v -p codesigning | grep -q "$SIGNING_IDENTITY"; then
+  SIGNING=(CODE_SIGN_IDENTITY="$SIGNING_IDENTITY" DEVELOPMENT_TEAM="$DEVELOPMENT_TEAM" OTHER_CODE_SIGN_FLAGS="--timestamp")
+else
+  echo "Signing identity not found; signing ad hoc."
+  SIGNING=(CODE_SIGN_IDENTITY="-" DEVELOPMENT_TEAM="" CODE_SIGN_STYLE=Manual)
+fi
 
 [[ -d ScreenBrightness/Assets.xcassets/AppIcon.appiconset ]] || swift scripts/make-icon.swift .
 xcodegen generate --quiet
 
 xcodebuild -project ScreenBrightness.xcodeproj -scheme ScreenBrightness -configuration Release \
   -destination 'generic/platform=macOS' -derivedDataPath build/DerivedData -quiet \
-  CODE_SIGN_IDENTITY="$SIGNING_IDENTITY" OTHER_CODE_SIGN_FLAGS="--timestamp" build
+  "${SIGNING[@]}" build
 
 rm -rf build/ScreenBrightness.app
 cp -R build/DerivedData/Build/Products/Release/ScreenBrightness.app build/

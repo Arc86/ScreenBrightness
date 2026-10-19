@@ -86,3 +86,7 @@ The tests compile the logic files directly rather than launching the app, so the
 | `ScreenBrightness/BrightnessMenu.swift`, `SettingsView.swift`, `LevelHUD.swift` | UI |
 | `ScreenBrightness/Intents.swift` | Shortcuts and Siri actions |
 | `Tests/` | Unit tests |
+
+## License
+
+MIT. See [LICENSE](LICENSE).

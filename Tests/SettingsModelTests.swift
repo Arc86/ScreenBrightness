@@ -28,3 +28,29 @@ import Testing
         #expect(Preset.defaults.count <= Preset.maximumCount)
     }
 }
+
+@Suite struct SharedStoreTests {
+    @Test func commandsRoundTrip() {
+        let id = UUID()
+        for command in [SharedStore.Command.step(.up), .step(.down), .applyPreset(id), .turnOffMonitor] {
+            #expect(SharedStore.Command(rawValue: command.rawValue) == command)
+        }
+        #expect(SharedStore.Command(rawValue: "preset:not-a-uuid") == nil)
+        #expect(SharedStore.Command(rawValue: "") == nil)
+    }
+
+    @Test func presetsWithoutAColorDecode() throws {
+        // Saved by versions before colour presets existed.
+        let json = #"[{"id":"6C1D7B0E-2F0C-4C55-9F38-1E4C2D7B9A10","name":"Day","level":50}]"#
+        let presets = try JSONDecoder().decode([Preset].self, from: Data(json.utf8))
+        #expect(presets.first?.colorPreset == nil)
+        #expect(presets.first?.level == 50)
+    }
+
+    @Test func presetsLoadFromTheGivenStore() throws {
+        let store = try #require(UserDefaults(suiteName: "ScreenBrightnessTests.\(UUID().uuidString)"))
+        let presets = [Preset(name: "Warm", level: 30, colorPreset: 0x04)]
+        Preset.save(presets, to: store)
+        #expect(Preset.load(from: store) == presets)
+    }
+}

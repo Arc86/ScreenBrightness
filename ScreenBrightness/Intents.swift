@@ -52,26 +52,6 @@ struct GetBrightnessIntent: AppIntent {
     }
 }
 
-struct ApplyPresetIntent: AppIntent {
-    static let title: LocalizedStringResource = "Apply Brightness Preset"
-    static let description = IntentDescription("Applies one of your brightness presets to the external monitor.")
-
-    @Parameter(title: "Preset")
-    var preset: PresetEntity
-
-    static var parameterSummary: some ParameterSummary {
-        Summary("Apply \(\.$preset)")
-    }
-
-    @MainActor
-    func perform() async throws -> some IntentResult {
-        let controller = BrightnessController.shared
-        let level = controller.presets.first { $0.id == preset.id }?.level ?? preset.level
-        controller.setLevel(Double(level), animated: true)
-        return .result()
-    }
-}
-
 struct SwitchInputIntent: AppIntent {
     static let title: LocalizedStringResource = "Switch Monitor Input"
     static let description = IntentDescription(
@@ -112,40 +92,6 @@ enum InputChoice: String, AppEnum {
     }
 }
 
-struct PresetEntity: AppEntity {
-    let id: UUID
-    let name: String
-    let level: Int
-
-    init(_ preset: Preset) {
-        id = preset.id
-        name = preset.name
-        level = preset.level
-    }
-
-    static let typeDisplayRepresentation: TypeDisplayRepresentation = "Brightness Preset"
-    static let defaultQuery = PresetQuery()
-
-    var displayRepresentation: DisplayRepresentation {
-        DisplayRepresentation(title: "\(name)", subtitle: "\(level)%")
-    }
-}
-
-struct PresetQuery: EntityQuery {
-    func entities(for identifiers: [UUID]) async throws -> [PresetEntity] {
-        await allPresets().filter { identifiers.contains($0.id) }
-    }
-
-    func suggestedEntities() async throws -> [PresetEntity] {
-        await allPresets()
-    }
-
-    @MainActor
-    private func allPresets() -> [PresetEntity] {
-        BrightnessController.shared.presets.map(PresetEntity.init)
-    }
-}
-
 struct ScreenBrightnessShortcuts: AppShortcutsProvider {
     static var appShortcuts: [AppShortcut] {
         AppShortcut(
@@ -166,5 +112,10 @@ struct ScreenBrightnessShortcuts: AppShortcutsProvider {
             phrases: ["What's the monitor brightness in \(.applicationName)"],
             shortTitle: "Get Brightness",
             systemImageName: "sun.min")
+        AppShortcut(
+            intent: TurnOffMonitorIntent(),
+            phrases: ["Turn off the monitor with \(.applicationName)"],
+            shortTitle: "Turn Off Monitor",
+            systemImageName: "moon.zzz")
     }
 }

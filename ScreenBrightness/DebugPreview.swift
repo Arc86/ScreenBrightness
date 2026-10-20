@@ -4,7 +4,7 @@ import SwiftUI
 
 /// Debug builds only: `SB_PREVIEW=1` opens the menu content in a normal window and
 /// flashes the HUD, so the UI can be screenshotted without clicking the menu bar.
-/// `SB_PREVIEW_LEVEL=<n>` jumps to a level; `SB_PREVIEW_SETTINGS=general|keyboard|presets` shows settings.
+/// `SB_PREVIEW_LEVEL=<n>` jumps to a level; `SB_PREVIEW_SETTINGS=general|keyboard|presets|schedule` shows settings.
 extension BrightnessController {
     func openDebugPreviewIfRequested() {
         guard ProcessInfo.processInfo.environment["SB_PREVIEW"] != nil else { return }
@@ -33,7 +33,7 @@ extension BrightnessController {
                 settings.title = "Settings preview"
                 settings.contentView = NSHostingView(rootView: SettingsView(
                     controller: self,
-                    pane: ["keyboard": .keyboard, "presets": .presets][ProcessInfo.processInfo.environment["SB_PREVIEW_SETTINGS"] ?? ""] ?? .general))
+                    pane: ["keyboard": .keyboard, "presets": .presets, "schedule": .schedule][ProcessInfo.processInfo.environment["SB_PREVIEW_SETTINGS"] ?? ""] ?? .general))
                 settings.center()
                 settings.makeKeyAndOrderFront(nil)
             }

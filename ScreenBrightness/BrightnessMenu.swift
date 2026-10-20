@@ -22,6 +22,11 @@ struct BrightnessMenu: View {
                            current: controller.level,
                            select: controller.apply(preset:))
                     .disabled(controller.status != .ready)
+                if let state = controller.scheduleState {
+                    ScheduleStatus(state: state, presets: controller.presets,
+                                   pausedUntil: controller.schedulePausedUntil,
+                                   resume: controller.resumeSchedule)
+                }
                 if controller.changeIgnored {
                     IgnoredChangeNotice(isHDRActive: controller.isHDRActive)
                 }
@@ -304,6 +309,69 @@ private struct NoticeCard<Actions: View>: View {
     }
 }
 
+/// What the schedule is doing: one line, or a pause notice with a way back.
+private struct ScheduleStatus: View {
+    let state: ScheduleState
+    let presets: [Preset]
+    let pausedUntil: Date?
+    let resume: () -> Void
+
+    var body: some View {
+        HStack(spacing: 6) {
+            Image(systemName: pausedUntil == nil ? "calendar.badge.clock" : "pause.circle")
+                .foregroundStyle(.secondary)
+            Group {
+                if let pausedUntil {
+                    Text("Paused until \(time(pausedUntil))")
+                } else {
+                    Text("\(name(of: state.current)) until \(time(state.nextAt)), then \(name(of: state.next))")
+                }
+            }
+            .font(.system(size: 11))
+            .foregroundStyle(.secondary)
+            .lineLimit(1)
+            Spacer(minLength: 4)
+            if pausedUntil != nil {
+                Button("Resume", action: resume)
+                    .controlSize(.mini)
+            }
+        }
+    }
+
+    private func name(of entry: ScheduleEntry) -> String {
+        presets.first { $0.id == entry.presetID }?.name ?? "?"
+    }
+
+    private func time(_ date: Date) -> String {
+        let time = date.formatted(.dateTime.hour().minute())
+        return Calendar.current.isDateInToday(date) ? time : "tomorrow \(time)"
+    }
+}
+
+/// Picks the monitor's colour temperature preset.
+private struct ColorRow: View {
+    let controller: BrightnessController
+
+    var body: some View {
+        HStack {
+            SettingLabel(title: "Color", systemImage: "thermometer.medium")
+            Spacer()
+            Menu {
+                ForEach(controller.colorPresets) { preset in
+                    Toggle(preset.name, isOn: Binding(
+                        get: { controller.colorPreset == preset },
+                        set: { _ in controller.setColorPreset(preset) }))
+                }
+            } label: {
+                Text(controller.colorPreset?.name ?? "Unknown")
+            }
+            .menuStyle(.button)
+            .controlSize(.small)
+            .fixedSize()
+        }
+    }
+}
+
 /// Picks the monitor's video input. Leaving this Mac's input needs a second click to confirm.
 private struct InputRow: View {
     let controller: BrightnessController
@@ -371,6 +439,9 @@ private struct MonitorControls: View {
             if let contrast = controller.contrast {
                 CompactSliderRow(title: "Contrast", systemImage: "circle.lefthalf.filled",
                                  value: contrast, onChange: controller.setContrast)
+            }
+            if !controller.colorPresets.isEmpty {
+                ColorRow(controller: controller)
             }
             if controller.isMonitorAudioActive, let volume = controller.volume {
                 VolumeRow(controller: controller, volume: volume)
@@ -466,6 +537,17 @@ private struct MenuFooter: View {
                 .font(.system(size: 11))
                 .foregroundStyle(.tertiary)
             Spacer()
+            Button {
+                // Give the click time to finish, or releasing the mouse wakes the display straight away.
+                Task {
+                    try? await Task.sleep(for: .milliseconds(600))
+                    DisplaySleep.sleepNow()
+                }
+            } label: {
+                Image(systemName: "moon.zzz")
+            }
+            .controlSize(.small)
+            .help("Turn off the monitor. Any key or mouse movement turns it back on.")
             Button("Settings…") {
                 NSApp.activate()
                 openSettings()

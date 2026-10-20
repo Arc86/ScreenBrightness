@@ -4,6 +4,8 @@ enum DDCProtocol {
     enum VCP: UInt8, Sendable {
         case brightness = 0x10
         case contrast = 0x12
+        /// Colour temperature preset, e.g. 5 = 6500 K. See `ColorPreset`.
+        case colorPreset = 0x14
         case input = 0x60
         case volume = 0x62
         /// 1 = muted, 2 = unmuted.

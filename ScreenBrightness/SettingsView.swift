@@ -3,7 +3,7 @@ import SwiftUI
 
 struct SettingsView: View {
     enum Pane: Hashable {
-        case general, keyboard, presets
+        case general, keyboard, presets, schedule
     }
 
     let controller: BrightnessController
@@ -24,6 +24,9 @@ struct SettingsView: View {
             }
             Tab("Presets", systemImage: "square.grid.2x2", value: .presets) {
                 PresetSettings(controller: controller)
+            }
+            Tab("Schedule", systemImage: "calendar.badge.clock", value: .schedule) {
+                ScheduleSettings(controller: controller)
             }
         }
         .frame(width: 480, height: 640)
@@ -74,6 +77,25 @@ private struct GeneralSettings: View {
                 Text("Idle")
             } footer: {
                 Text(idleFooter)
+                    .foregroundStyle(.secondary)
+            }
+
+            Section {
+                Toggle(isOn: $controller.turnsOffWhenLocked) {
+                    Text("Turn off the monitor when the screen locks")
+                    Text("Instead of showing the lock screen until the display goes to sleep on its own. Easier on an OLED.")
+                }
+                if controller.turnsOffWhenLocked {
+                    Picker("After", selection: $controller.lockDelay) {
+                        ForEach(BrightnessController.lockDelayChoices, id: \.self) { seconds in
+                            Text(seconds < 60 ? "\(seconds) seconds" : "1 minute").tag(seconds)
+                        }
+                    }
+                }
+            } header: {
+                Text("Screen Lock")
+            } footer: {
+                Text("The displays go to sleep, which any key or mouse movement undoes. If they wake at the lock screen and are left alone, they go back to sleep.")
                     .foregroundStyle(.secondary)
             }
 
@@ -158,7 +180,8 @@ private struct PresetSettings: View {
             Section {
                 List {
                     ForEach($controller.presets) { $preset in
-                        PresetEditorRow(preset: $preset, minimum: Int(controller.minimumLevel)) {
+                        PresetEditorRow(preset: $preset, minimum: Int(controller.minimumLevel),
+                                        colorPresets: controller.colorPresets) {
                             controller.presets.removeAll { $0.id == preset.id }
                         }
                     }
@@ -166,7 +189,9 @@ private struct PresetSettings: View {
                 }
             } footer: {
                 HStack {
-                    Text("Click a name to rename it. Drag to reorder.")
+                    Text(controller.colorPresets.isEmpty
+                         ? "Click a name to rename it. Drag to reorder."
+                         : "Click a name to rename it. Drag to reorder. A preset can also switch the monitor's color temperature.")
                         .foregroundStyle(.secondary)
                     Spacer()
                     Button("Add Current Level") { controller.addPreset() }
@@ -182,19 +207,32 @@ private struct PresetSettings: View {
 private struct PresetEditorRow: View {
     @Binding var preset: Preset
     let minimum: Int
+    let colorPresets: [ColorPreset]
     let delete: () -> Void
 
     var body: some View {
         HStack(spacing: 12) {
             TextField("Name", text: $preset.name)
                 .labelsHidden()
-                .frame(width: 120)
+                .frame(width: colorPresets.isEmpty ? 120 : 96)
             Slider(value: Binding(get: { Double(preset.level) }, set: { preset.level = Int($0.rounded()) }),
                    in: Double(min(minimum, preset.level))...100)
             Text(Double(preset.level) / 100, format: .percent)
                 .monospacedDigit()
                 .foregroundStyle(preset.level < 0 ? AnyShapeStyle(.indigo) : AnyShapeStyle(.secondary))
                 .frame(width: 44, alignment: .trailing)
+            if !colorPresets.isEmpty {
+                Picker("Color", selection: $preset.colorPreset) {
+                    Text("Keep Color").tag(Int?.none)
+                    Divider()
+                    ForEach(colorPresets) { color in
+                        Text(color.name).tag(Optional(color.code))
+                    }
+                }
+                .labelsHidden()
+                .fixedSize()
+                .help("Color temperature to switch to")
+            }
             Button(role: .destructive, action: delete) {
                 Image(systemName: "minus.circle.fill")
                     .foregroundStyle(.red)
@@ -269,5 +307,203 @@ private struct ShortcutRecorder: View {
         isRecording = false
         if let monitor { NSEvent.removeMonitor(monitor) }
         monitor = nil
+    }
+}
+
+private struct ScheduleSettings: View {
+    @Bindable var controller: BrightnessController
+
+    var body: some View {
+        Form {
+            Section {
+                Toggle(isOn: $controller.schedule.isEnabled) {
+                    Text("Follow a schedule")
+                    Text("Applies presets through the day, fading from one to the next.")
+                }
+            } footer: {
+                Text("Changing brightness yourself pauses the schedule until its next change.")
+                    .foregroundStyle(.secondary)
+            }
+
+            Section {
+                List {
+                    ForEach($controller.schedule.entries) { $entry in
+                        ScheduleEntryRow(entry: $entry, presets: controller.presets,
+                                         sunTimes: sunTimes) {
+                            controller.schedule.entries.removeAll { $0.id == entry.id }
+                        }
+                    }
+                }
+                Picker("Transition", selection: $controller.schedule.transitionMinutes) {
+                    ForEach(BrightnessSchedule.transitionChoices, id: \.self) { minutes in
+                        Text(minutes == 0 ? "Instant" : minutes < 60 ? "\(minutes) minutes" : "1 hour").tag(minutes)
+                    }
+                }
+            } header: {
+                Text("Times")
+            } footer: {
+                HStack {
+                    Text("The transition starts at each time.")
+                        .foregroundStyle(.secondary)
+                    Spacer()
+                    Button("Add Time", action: addEntry)
+                        .disabled(controller.schedule.entries.count >= BrightnessSchedule.maximumEntries
+                                  || controller.presets.isEmpty)
+                }
+            }
+
+            if controller.schedule.usesSun {
+                Section {
+                    LocationRow(location: controller.sunLocation, sunTimes: sunTimes)
+                } header: {
+                    Text("Sunrise and Sunset")
+                }
+            }
+        }
+        .formStyle(.grouped)
+    }
+
+    private var sunTimes: SunTimes? {
+        controller.sunLocation.coordinate.flatMap { SunTimes(on: .now, at: $0, calendar: .current) }
+    }
+
+    private func addEntry() {
+        guard let preset = controller.presets.first else { return }
+        controller.schedule.entries.append(ScheduleEntry(trigger: .time, minutes: 12 * 60, presetID: preset.id))
+    }
+}
+
+private struct ScheduleEntryRow: View {
+    @Binding var entry: ScheduleEntry
+    let presets: [Preset]
+    let sunTimes: SunTimes?
+    let delete: () -> Void
+
+    private static let offsets = [-60, -30, -15, 0, 15, 30, 60]
+
+    var body: some View {
+        HStack(spacing: 8) {
+            Picker("When", selection: $entry.trigger) {
+                Text("At").tag(ScheduleEntry.Trigger.time)
+                Text("Sunrise").tag(ScheduleEntry.Trigger.sunrise)
+                Text("Sunset").tag(ScheduleEntry.Trigger.sunset)
+            }
+            .labelsHidden()
+            .fixedSize()
+            .onChange(of: entry.trigger) { old, new in
+                // Switching between a clock time and the sun: start from a sensible value.
+                if (old == .time) != (new == .time) { entry.minutes = new == .time ? 12 * 60 : 0 }
+            }
+
+            if entry.trigger == .time {
+                DatePicker("Time", selection: timeBinding, displayedComponents: .hourAndMinute)
+                    .labelsHidden()
+                    .fixedSize()
+            } else {
+                Picker("Offset", selection: $entry.minutes) {
+                    ForEach(Self.offsets, id: \.self) { minutes in
+                        Text(offsetName(minutes)).tag(minutes)
+                    }
+                }
+                .labelsHidden()
+                .fixedSize()
+                if let date = sunDate {
+                    Text(date, format: .dateTime.hour().minute())
+                        .monospacedDigit()
+                        .foregroundStyle(.secondary)
+                }
+            }
+
+            Spacer(minLength: 4)
+            Image(systemName: "arrow.right")
+                .foregroundStyle(.tertiary)
+            Picker("Preset", selection: $entry.presetID) {
+                ForEach(presets) { preset in
+                    Text(preset.name).tag(preset.id)
+                }
+                if !presets.contains(where: { $0.id == entry.presetID }) {
+                    Text("Deleted Preset").tag(entry.presetID)
+                }
+            }
+            .labelsHidden()
+            .fixedSize()
+
+            Button(role: .destructive, action: delete) {
+                Image(systemName: "minus.circle.fill")
+                    .foregroundStyle(.red)
+            }
+            .buttonStyle(.borderless)
+            .help("Remove time")
+        }
+    }
+
+    private func offsetName(_ minutes: Int) -> String {
+        switch minutes {
+        case 0: "on time"
+        case ..<0: "\(-minutes) min before"
+        default: "\(minutes) min after"
+        }
+    }
+
+    private var sunDate: Date? {
+        guard let sunTimes else { return nil }
+        let base = entry.trigger == .sunrise ? sunTimes.sunrise : sunTimes.sunset
+        return base.addingTimeInterval(Double(entry.minutes) * 60)
+    }
+
+    /// Minutes after midnight shown as a time today.
+    private var timeBinding: Binding<Date> {
+        Binding(
+            get: { Calendar.current.startOfDay(for: .now).addingTimeInterval(Double(entry.minutes) * 60) },
+            set: { date in
+                let parts = Calendar.current.dateComponents([.hour, .minute], from: date)
+                entry.minutes = (parts.hour ?? 0) * 60 + (parts.minute ?? 0)
+            })
+    }
+}
+
+private struct LocationRow: View {
+    let location: SunLocation
+    let sunTimes: SunTimes?
+
+    var body: some View {
+        switch location.status {
+        case .locating:
+            LabeledContent("Location") {
+                HStack(spacing: 6) {
+                    ProgressView().controlSize(.small)
+                    Text("Locating…")
+                }
+            }
+        case .denied:
+            LabeledContent {
+                Button("Open Privacy Settings") {
+                    NSWorkspace.shared.open(URL(string: "x-apple.systempreferences:com.apple.preference.security?Privacy_LocationServices")!)
+                }
+            } label: {
+                Text("Location access is off")
+                Text("Sunrise and sunset times need your approximate location. Clock times still work.")
+            }
+        case .failed where location.coordinate == nil:
+            LabeledContent {
+                Button("Try Again", action: location.locate)
+            } label: {
+                Text("Couldn't find your location")
+                Text("Location Services may be turned off in System Settings.")
+            }
+        default:
+            if let sunTimes {
+                LabeledContent("Today") {
+                    Text("Sunrise \(sunTimes.sunrise, format: .dateTime.hour().minute()) · Sunset \(sunTimes.sunset, format: .dateTime.hour().minute())")
+                        .monospacedDigit()
+                }
+            } else if location.coordinate != nil {
+                LabeledContent("Today", value: "The sun doesn't rise or set")
+            } else {
+                LabeledContent("Location") {
+                    Button("Find My Location", action: location.locate)
+                }
+            }
+        }
     }
 }

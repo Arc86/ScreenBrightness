@@ -13,7 +13,9 @@ final class BrightnessController {
     static let shared = BrightnessController()
 
     static let idleMinuteChoices = [1, 2, 5, 10, 15, 30]
+    static let lockDelayChoices = [5, 15, 30, 60]
     private static let log = Logger(subsystem: "com.jespermol.ScreenBrightness", category: "idle")
+    private static let scheduleLog = Logger(subsystem: "com.jespermol.ScreenBrightness", category: "schedule")
 
     // MARK: Monitor state
 
@@ -25,6 +27,8 @@ final class BrightnessController {
     private(set) var currentInput: MonitorInput?
     /// 0…100, or nil when the monitor doesn't report it.
     private(set) var contrast: Double?
+    /// The monitor's colour temperature preset, when it lists them.
+    private(set) var colorPreset: ColorPreset?
     private(set) var volume: Double?
     private(set) var isMuted = false
     /// Sound is playing through the monitor, so its volume is ours to control.
@@ -39,8 +43,15 @@ final class BrightnessController {
     private(set) var launchesAtLogin = SMAppService.mainApp.status == .enabled
     /// Shortcuts another app already owns.
     private(set) var hotkeyConflicts: Set<BrightnessDirection> = []
+    /// Where the schedule stands, while it is on and can be placed in the day.
+    private(set) var scheduleState: ScheduleState?
+    /// Set by a manual change while the schedule is on; the schedule takes over again at this time.
+    private(set) var schedulePausedUntil: Date? = UserDefaults.standard.object(forKey: "schedulePausedUntil") as? Date {
+        didSet { UserDefaults.standard.set(schedulePausedUntil, forKey: "schedulePausedUntil") }
+    }
 
     var inputs: [MonitorInput] { capabilities?.inputs ?? [] }
+    var colorPresets: [ColorPreset] { capabilities?.colorPresets ?? [] }
     var minimumLevel: Double { allowsExtraDimming ? BrightnessLevel.extraDimFloor : 0 }
 
     // MARK: Settings
@@ -49,7 +60,27 @@ final class BrightnessController {
         didSet {
             Preset.save(presets)
             ScreenBrightnessShortcuts.updateAppShortcutParameters()
+            if schedule.isEnabled { updateSchedule() }
         }
+    }
+    var schedule = StoredSettings.schedule() {
+        didSet {
+            StoredSettings.set(schedule)
+            if !schedule.isEnabled || schedule.entries != oldValue.entries {
+                // Start over: the next update fades in from wherever the new schedule says it should be.
+                activeScheduleEntryID = nil
+                schedulePausedUntil = nil
+            }
+            if schedule.usesSun { sunLocation.updateIfNeeded() }
+            updateSchedule()
+        }
+    }
+    var turnsOffWhenLocked = StoredSettings.bool("turnsOffWhenLocked", default: false) {
+        didSet { StoredSettings.set(turnsOffWhenLocked, for: "turnsOffWhenLocked") }
+    }
+    /// Seconds after locking before the displays go to sleep.
+    var lockDelay = StoredSettings.integer("lockDelay", default: 15) {
+        didSet { StoredSettings.set(lockDelay, for: "lockDelay") }
     }
     var smoothTransitions = StoredSettings.bool("smoothTransitions", default: true) {
         didSet { StoredSettings.set(smoothTransitions, for: "smoothTransitions") }
@@ -83,6 +114,7 @@ final class BrightnessController {
     }
 
     let inputTap = SystemInputTap()
+    let sunLocation = SunLocation()
 
     @ObservationIgnored private let link = DDCLink()
     @ObservationIgnored private let hud = LevelHUD()
@@ -98,11 +130,20 @@ final class BrightnessController {
     @ObservationIgnored private var verifyTask: Task<Void, Never>?
     @ObservationIgnored private var idleRestoreLevel: Double?
     @ObservationIgnored private var idleTimer: Timer?
+    @ObservationIgnored private var scheduleTimer: Timer?
+    /// The entry the schedule last faded into, and the level that fade started from.
+    @ObservationIgnored private var activeScheduleEntryID: UUID?
+    @ObservationIgnored private var scheduleFadeStart: Double = 50
+    @ObservationIgnored private var lockTask: Task<Void, Never>?
+    /// A control's command that launched the app, run once the monitor answers.
+    @ObservationIgnored private var launchCommand = UserDefaults.standard.string(forKey: "command").flatMap(SharedStore.Command.init)
     #if DEBUG
     @ObservationIgnored private let createdAt = Date.now
     #endif
 
     private init() {
+        // Copies presets saved by older versions into the shared store, where the controls extension reads them.
+        Preset.save(presets)
         inputTap.onBrightnessKey = { [weak self] direction, fine in
             self?.step(direction: direction, fine: fine)
         }
@@ -127,6 +168,27 @@ final class BrightnessController {
         }
         NSWorkspace.shared.notificationCenter.addObserver(forName: NSWorkspace.didWakeNotification, object: nil, queue: .main) { [weak self] _ in
             MainActor.assumeIsolated { self?.reconnect() }
+        }
+        let distributed = DistributedNotificationCenter.default()
+        distributed.addObserver(forName: DisplaySleep.lockedNotification, object: nil, queue: .main) { [weak self] _ in
+            MainActor.assumeIsolated { self?.screenLocked() }
+        }
+        distributed.addObserver(forName: DisplaySleep.unlockedNotification, object: nil, queue: .main) { [weak self] _ in
+            MainActor.assumeIsolated {
+                self?.lockTask?.cancel()
+                self?.lockTask = nil
+            }
+        }
+        distributed.addObserver(forName: SharedStore.commandNotification, object: nil, queue: .main) { [weak self] notification in
+            let command = (notification.object as? String).flatMap(SharedStore.Command.init)
+            MainActor.assumeIsolated {
+                if let command { self?.perform(command) }
+            }
+        }
+        sunLocation.onChange = { [weak self] in self?.updateSchedule() }
+        if schedule.isEnabled && schedule.usesSun { sunLocation.updateIfNeeded() }
+        scheduleTimer = Timer.scheduledTimer(withTimeInterval: 30, repeats: true) { [weak self] _ in
+            MainActor.assumeIsolated { self?.updateSchedule() }
         }
         scheduleIdleCheck(after: 5)
         Task { await refresh() }
@@ -163,6 +225,12 @@ final class BrightnessController {
             capabilities = await loadCapabilities()
         }
         await refreshMonitorControls()
+
+        updateSchedule()
+        if let command = launchCommand {
+            launchCommand = nil
+            perform(command)
+        }
     }
 
     /// After a restart the monitor still sits at 0, but the software dimming on top of it is gone.
@@ -182,6 +250,10 @@ final class BrightnessController {
         }
         if capabilities.supports(.contrast), let reading = await link.read(.contrast) {
             contrast = percent(reading)
+        }
+        if !colorPresets.isEmpty, let reading = await link.read(.colorPreset) {
+            let code = ColorPreset.fromReading(reading.current, monitor: display?.storageKey)
+            colorPreset = colorPresets.first { $0.code == code }
         }
         if capabilities.supports(.volume), let reading = await link.read(.volume) {
             volume = percent(reading)
@@ -209,14 +281,29 @@ final class BrightnessController {
 
     // MARK: Brightness
 
+    /// A deliberate change by the user, from the menu, keys, presets or Shortcuts.
     func setLevel(_ value: Double, animated: Bool = false, showHUD: Bool = false) {
         // Any deliberate change ends an idle dim; there is nothing left to restore.
         endIdleDim(restoring: false)
+        pauseSchedule()
         changeLevel(to: value, duration: animated ? 0.3 : 0, showHUD: showHUD)
     }
 
     func apply(preset: Preset) {
         setLevel(Double(preset.level), animated: true)
+        applyColor(of: preset)
+    }
+
+    /// Runs a command sent by a Control Center control.
+    func perform(_ command: SharedStore.Command) {
+        switch command {
+        case .step(let direction):
+            step(direction: direction, fine: false)
+        case .applyPreset(let id):
+            if let preset = presets.first(where: { $0.id == id }) { apply(preset: preset) }
+        case .turnOffMonitor:
+            DisplaySleep.sleepNow()
+        }
     }
 
     func step(direction: BrightnessDirection, fine: Bool) {
@@ -355,7 +442,106 @@ final class BrightnessController {
         idleRestoreLevel = nil
     }
 
-    // MARK: Volume and contrast
+    // MARK: Schedule
+
+    /// Moves brightness towards where the schedule says it should be. Runs every 30 seconds,
+    /// so a long transition creeps along a step at a time.
+    private func updateSchedule() {
+        guard schedule.isEnabled, let state = schedule.state(at: .now, location: sunLocation.coordinate) else {
+            scheduleState = nil
+            activeScheduleEntryID = nil
+            return
+        }
+        scheduleState = state
+        if let pausedUntil = schedulePausedUntil {
+            guard Date.now >= pausedUntil else { return }
+            schedulePausedUntil = nil
+        }
+        guard status == .ready else { return }
+
+        if state.current.id != activeScheduleEntryID {
+            let isFirstUpdate = activeScheduleEntryID == nil
+            activeScheduleEntryID = state.current.id
+            // Joining mid-transition (at launch, or when the schedule was just turned on) picks up the fade
+            // where it would have been; a new entry fades from wherever brightness is now.
+            if isFirstUpdate, let previous = state.previous,
+               let previousLevel = presets.first(where: { $0.id == previous.presetID })?.level {
+                scheduleFadeStart = Double(previousLevel)
+            } else {
+                scheduleFadeStart = idleRestoreLevel ?? targetLevel
+            }
+            if let preset = presets.first(where: { $0.id == state.current.presetID }) {
+                Self.scheduleLog.info("Fading into \(preset.name, privacy: .public) from \(self.scheduleFadeStart)")
+                applyColor(of: preset)
+            }
+        }
+
+        guard let level = state.level(from: scheduleFadeStart, presets: presets) else { return }
+        let clamped = min(max(level, minimumLevel), 100)
+        if isIdleDimmed {
+            idleRestoreLevel = clamped
+        } else if abs(clamped - targetLevel) >= 0.5 {
+            changeLevel(to: clamped, duration: 1)
+        }
+    }
+
+    private func pauseSchedule() {
+        guard schedule.isEnabled, let scheduleState else { return }
+        schedulePausedUntil = scheduleState.nextAt
+    }
+
+    func resumeSchedule() {
+        guard let scheduleState else { return }
+        schedulePausedUntil = nil
+        activeScheduleEntryID = scheduleState.current.id
+        scheduleFadeStart = targetLevel
+        if let preset = presets.first(where: { $0.id == scheduleState.current.presetID }) {
+            applyColor(of: preset)
+        }
+        updateSchedule()
+    }
+
+    // MARK: Screen lock
+
+    /// Puts the displays to sleep a little after the screen locks, and again whenever they wake
+    /// at the lock screen and are left alone, so an OLED doesn't sit on a static image.
+    private func screenLocked() {
+        lockTask?.cancel()
+        guard turnsOffWhenLocked else { return }
+        let delay = Double(lockDelay)
+        lockTask = Task { [weak self] in
+            var wait = delay
+            while !Task.isCancelled {
+                try? await Task.sleep(for: .seconds(wait))
+                guard !Task.isCancelled, let self, self.turnsOffWhenLocked, DisplaySleep.isScreenLocked else { return }
+                let idle = SystemStatus.secondsSinceLastInput() ?? 0
+                if idle + 0.5 >= delay, !DisplaySleep.isAsleep(self.display?.displayID) {
+                    Self.log.info("Screen locked and idle for \(Int(idle)) s, sleeping displays")
+                    DisplaySleep.sleepNow()
+                }
+                wait = 5
+            }
+        }
+    }
+
+    // MARK: Colour, volume and contrast
+
+    func setColorPreset(_ preset: ColorPreset) {
+        guard colorPresets.contains(preset) else { return }
+        colorPreset = preset
+        link.set(.colorPreset, value: preset.code)
+        // Some presets (sRGB) lock brightness; read it back so the menu shows what the monitor did.
+        Task { [weak self] in
+            try? await Task.sleep(for: .seconds(1.5))
+            await self?.refresh()
+        }
+    }
+
+    private func applyColor(of preset: Preset) {
+        guard let code = preset.colorPreset, code != colorPreset?.code,
+              let color = colorPresets.first(where: { $0.code == code }) else { return }
+        setColorPreset(color)
+    }
 
     func setContrast(_ value: Double) {
         let value = min(max(value, 0), 100).rounded()
@@ -469,5 +655,18 @@ private enum StoredSettings {
 
     static func set(_ hotkey: Hotkey?, for key: String) {
         UserDefaults.standard.set(hotkey.flatMap { try? JSONEncoder().encode($0) } ?? Data(), forKey: key)
+    }
+
+    /// Until the user sets one up, the schedule is a disabled suggestion built from the presets.
+    static func schedule() -> BrightnessSchedule {
+        guard let data = UserDefaults.standard.data(forKey: "schedule"),
+              let schedule = try? JSONDecoder().decode(BrightnessSchedule.self, from: data) else {
+            return .suggested(for: Preset.load())
+        }
+        return schedule
+    }
+
+    static func set(_ schedule: BrightnessSchedule) {
+        UserDefaults.standard.set(try? JSONEncoder().encode(schedule), forKey: "schedule")
     }
 }
